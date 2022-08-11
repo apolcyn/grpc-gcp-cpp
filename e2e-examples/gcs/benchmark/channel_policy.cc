@@ -1,8 +1,55 @@
 #include "channel_policy.h"
 
 #include <unordered_map>
+#include <thread>
+#include <chrono>
 
 #include "absl/synchronization/mutex.h"
+
+class ChannelPoller {
+ public:
+  ChannelPoller(std::shared_ptr<grpc::Channel> channel)
+      : channel_(channel) {
+    thread_ = std::unique_ptr<std::thread>(new std::thread([this](){
+      bool ok = false;
+      void* tag = nullptr;
+      StartWatch();
+      while (cq_.Next(&tag, &ok)) {
+        absl::MutexLock lock(&mu_);
+        if (!shutdown_ && ok) {
+          StartWatch();
+        }
+      }
+    }));
+  }
+
+  ~ChannelPoller() {
+    {
+      absl::MutexLock lock(&mu_);
+      channel_.reset();
+      shutdown_ = true;
+      cq_.Shutdown();
+    }
+    thread_->join();
+  }
+
+ private:
+  void StartWatch() {
+    grpc_connectivity_state last_observed = channel_->GetState(true);
+    channel_->NotifyOnStateChange(
+        last_observed,
+        std::chrono::system_clock::now() +
+        std::chrono::seconds(1000),
+        &cq_,
+        nullptr);
+  }
+
+  std::shared_ptr<grpc::Channel> channel_;
+  grpc::CompletionQueue cq_;
+  std::unique_ptr<std::thread> thread_;
+  absl::Mutex mu_;
+  bool shutdown_ = false;
+};
 
 class ConstChannelPool : public StorageStubProvider {
  public:
@@ -10,6 +57,12 @@ class ConstChannelPool : public StorageStubProvider {
       std::function<std::shared_ptr<grpc::Channel>()> channel_creator)
       : channel_creator_(channel_creator) {
     channel_ = channel_creator();
+    poller_ = new ChannelPoller(channel_);
+  }
+
+  ~ConstChannelPool() {
+    channel_.reset(); // let poller_ remove the last ref to the channel
+    delete poller_;
   }
 
   StorageStubProvider::StubHolder GetStorageStub() override {
@@ -33,6 +86,7 @@ class ConstChannelPool : public StorageStubProvider {
  private:
   std::function<std::shared_ptr<grpc::Channel>()> channel_creator_;
   std::shared_ptr<grpc::Channel> channel_;
+  ChannelPoller* poller_;
 };
 
 std::shared_ptr<StorageStubProvider> CreateConstChannelPool(
